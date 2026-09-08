@@ -1,4 +1,10 @@
-import logging
+"""scikit-learn estimators for the two kappa-eta stages and their composition.
+
+``KappaEncoder`` is the kappa-encoding stage, ``EtaRegressor`` the eta-prediction
+stage, and ``KappaEtaRegressor`` the composed pipeline the paper writes as
+``y_hat = g_eta(f_kappa(X))``. These are the forward model only; hyperparameter
+selection lives in ``methodology.py``.
+"""
 
 import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin, TransformerMixin
@@ -6,9 +12,13 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 
+from ._backend import resolve_backend
 from ._numba import encode_columns, eta_predict_chunk
 
-logger = logging.getLogger(__name__)
+try:
+    from . import mlx_ops
+except ImportError:
+    mlx_ops = None
 
 
 class KappaEncoder(BaseEstimator, TransformerMixin):
@@ -19,10 +29,14 @@ class KappaEncoder(BaseEstimator, TransformerMixin):
     kappa : float or array-like
         Decay exponent(s).  A scalar is broadcast to all features;
         an array must have length ``n_features``.
+    backend : {"mlx", "cpu", None}
+        Which implementation to use. ``None`` (default) resolves to MLX if
+        installed (Apple Silicon), else "cpu" (numba kernels).
     """
 
-    def __init__(self, kappa=0):
+    def __init__(self, kappa=0, backend=None):
         self.kappa = kappa
+        self.backend = backend
 
     def fit(self, X, y):
         self.columns = list(range(X.shape[1]))
@@ -36,9 +50,12 @@ class KappaEncoder(BaseEstimator, TransformerMixin):
         else:
             self.kappa = {col: kappa_val[col] for col in self.columns}
 
+        self.backend_ = resolve_backend(self.backend)
         return self
 
     def transform(self, X, y=None):
+        if self.backend_ == "mlx":
+            return self._encode_mlx(X.copy())
         return self._encode_numba(X.copy())
 
     def fit_transform(self, X, y=None, **fit_params):
@@ -58,6 +75,18 @@ class KappaEncoder(BaseEstimator, TransformerMixin):
             kappa_values_arr,
         )
 
+    def _encode_mlx(self, X):
+        train_col_values_arr = [self.train_col_values[col] for col in self.columns]
+        kappa_values_arr = [self.kappa[col] for col in self.columns]
+        encoded = mlx_ops.encode_columns_mlx(
+            X,
+            np.array(self.columns),
+            train_col_values_arr,
+            self.train_target_values,
+            kappa_values_arr,
+        )
+        return np.array(encoded)
+
 
 class EtaRegressor(BaseEstimator, RegressorMixin):
     """Distance-weighted regressor using eta-decay kernels.
@@ -66,15 +95,20 @@ class EtaRegressor(BaseEstimator, RegressorMixin):
     ----------
     eta : float
         Distance-decay exponent.
+    backend : {"mlx", "cpu", None}
+        Which implementation to use. ``None`` (default) resolves to MLX if
+        installed (Apple Silicon), else "cpu" (numba kernels).
     """
 
-    def __init__(self, eta=1.0):
+    def __init__(self, eta=1.0, backend=None):
         self.eta = float(eta) if hasattr(eta, "ndim") else eta
+        self.backend = backend
 
     def fit(self, X, y):
         X, y = check_X_y(X, y, dtype=np.float32)
         self.X_train_ = X
         self.y_train_ = y
+        self.backend_ = resolve_backend(self.backend)
         return self
 
     def predict(self, X):
@@ -83,6 +117,11 @@ class EtaRegressor(BaseEstimator, RegressorMixin):
 
         if self.eta == 0:
             return np.full(X.shape[0], np.mean(self.y_train_))
+
+        if self.backend_ == "mlx":
+            return np.array(
+                mlx_ops.eta_predict_mlx(X, self.X_train_, self.y_train_, np.float32(self.eta))
+            )
 
         return np.asarray(
             eta_predict_chunk(X, self.X_train_, self.y_train_, np.float32(self.eta))
@@ -98,18 +137,22 @@ class KappaEtaRegressor(BaseEstimator, RegressorMixin):
         Kappa decay exponent.
     eta : float
         Eta distance-decay exponent.
+    backend : {"mlx", "cpu", None}
+        Which implementation to use. ``None`` (default) resolves to MLX if
+        installed (Apple Silicon), else "cpu" (numba kernels).
     """
 
-    def __init__(self, kappa=2.0, eta=2.0):
+    def __init__(self, kappa=2.0, eta=2.0, backend=None):
         self.kappa = float(kappa) if hasattr(kappa, "ndim") else kappa
         self.eta = float(eta) if hasattr(eta, "ndim") else eta
+        self.backend = backend
 
     def fit(self, X, y):
         X, y = check_X_y(X, y, dtype=np.float32)
         self.pipeline_ = Pipeline([
             ("scaler", MinMaxScaler()),
-            ("encoder", KappaEncoder(kappa=self.kappa)),
-            ("regressor", EtaRegressor(eta=self.eta)),
+            ("encoder", KappaEncoder(kappa=self.kappa, backend=self.backend)),
+            ("regressor", EtaRegressor(eta=self.eta, backend=self.backend)),
         ])
         self.pipeline_.fit(X, y)
         return self
@@ -118,32 +161,3 @@ class KappaEtaRegressor(BaseEstimator, RegressorMixin):
         check_is_fitted(self, "pipeline_")
         X = check_array(X, dtype=np.float32)
         return self.pipeline_.predict(X)
-
-    def grid_search(self, X, y, param_grid=None, cv=5,
-                    scoring="neg_mean_squared_error", n_jobs=-1, verbose=1):
-        """Exhaustive grid search over kappa/eta values."""
-        from sklearn.model_selection import GridSearchCV
-
-        X, y = check_X_y(X, y, dtype=np.float32)
-        if param_grid is None:
-            param_grid = {
-                "kappa": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0],
-                "eta": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0],
-            }
-        gs = GridSearchCV(
-            estimator=self,
-            param_grid=param_grid,
-            cv=cv,
-            scoring=scoring,
-            n_jobs=n_jobs,
-            verbose=verbose,
-            refit=True,
-        )
-        gs.fit(X, y)
-        self.best_params_ = gs.best_params_
-        self.best_score_ = gs.best_score_
-        self.grid_search_results_ = gs.cv_results_
-        self.kappa = self.best_params_["kappa"]
-        self.eta = self.best_params_["eta"]
-        self.fit(X, y)
-        return self

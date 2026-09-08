@@ -1,15 +1,21 @@
+"""numba-compiled CPU kernels for the kappa-encoding and eta-prediction stages.
+
+These serve ``backend="cpu"`` in ``kappaeta.estimators``. The gradient path
+under that backend is JAX's, not numba's -- see ``kappaeta._backend``.
+"""
+
 import numpy as np
 from numba import njit, prange
 
 
 @njit(fastmath=True)
 def kappa_impute_numba(x_t, x_i, y_i, kappa):
-    """Weighted imputation of a single test value using kappa decay.
+    """Weighted imputation of a single query value using kappa decay.
 
     Parameters
     ----------
     x_t : float
-        Test value to impute.
+        Query value to impute.
     x_i : ndarray, shape (n_train,)
         Training feature values.
     y_i : ndarray, shape (n_train,)
@@ -59,28 +65,33 @@ def encode_columns(X_encoded, columns, train_col_values, train_target_values, ka
         unique_vals_train = np.unique(X_train_col_np)
         unique_vals = np.unique(np.concatenate((unique_vals_x, unique_vals_train)))
 
-        for val in unique_vals:
-            imputed_value = kappa_impute_numba(
-                val,
+        imputed_values = np.empty(len(unique_vals), dtype=np.float32)
+        for u in range(len(unique_vals)):
+            imputed_values[u] = kappa_impute_numba(
+                unique_vals[u],
                 X_train_col_np,
                 train_target_values,
                 kappa_values[col_idx],
             )
-            for row_idx in range(n_rows):
-                if X_encoded[row_idx, col] == val:
-                    X_encoded[row_idx, col] = imputed_value
+
+        # Map each row's raw value to its imputed value by binary search on the
+        # sorted unique values, so the pass costs O(n_rows log n_unique) rather
+        # than a rescan of all rows per unique value.
+        row_lookup = np.searchsorted(unique_vals, X_encoded[:, col])
+        for row_idx in range(n_rows):
+            X_encoded[row_idx, col] = imputed_values[row_lookup[row_idx]]
 
     return X_encoded
 
 
 @njit(parallel=True, cache=True)
 def eta_predict_chunk(X_chunk, X_train, y_train, eta):
-    """Predict targets for a chunk of test samples using eta-weighted distances.
+    """Predict targets for a chunk of query samples using eta-weighted distances.
 
     Parameters
     ----------
-    X_chunk : ndarray, shape (n_test, n_features)
-        Test samples.
+    X_chunk : ndarray, shape (n_eval, n_features)
+        Query samples.
     X_train : ndarray, shape (n_train, n_features)
         Training samples (encoded).
     y_train : ndarray, shape (n_train,)
@@ -90,7 +101,7 @@ def eta_predict_chunk(X_chunk, X_train, y_train, eta):
 
     Returns
     -------
-    ndarray, shape (n_test,)
+    ndarray, shape (n_eval,)
         Predicted values.
     """
     n_samples = X_chunk.shape[0]

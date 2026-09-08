@@ -1,3 +1,17 @@
+"""The closed-form first-order gradients derived in the paper.
+
+These implement dL/deta and dL/dkappa_p directly from the boxed expressions in
+the Analytical Derivations section, including the dual dependency of kappa on
+both the evaluation and the reference encoding. They exist to validate the
+automatic-differentiation gradients the optimizers actually consume, and
+01_gradient_validation.ipynb is where that comparison is made.
+
+Scope: written for the univariate validation set, so the prediction-stage terms
+index feature column 0. They are deliberately naive loop-for-loop
+transcriptions of the algebra rather than a vectorised implementation, so that
+they can be read against the paper term by term.
+"""
+
 import numpy as np
 from sklearn.pipeline import Pipeline
 
@@ -9,10 +23,10 @@ def analytical_derivative_eta(pipeline: Pipeline, X: np.ndarray, y: np.ndarray) 
     ----------
     pipeline : Pipeline
         Fitted pipeline containing kappa_encoder and eta_regressor steps.
-    X : ndarray, shape (n_test, n_features)
-        Test features.
-    y : ndarray, shape (n_test,)
-        Test targets.
+    X : ndarray, shape (n_eval, n_features)
+        Evaluation-set features.
+    y : ndarray, shape (n_eval,)
+        Evaluation-set targets.
 
     Returns
     -------
@@ -52,16 +66,16 @@ def analytical_derivative_kappa_complete(
 ) -> float:
     """Compute dL/dκ_p analytically via the full chain rule.
 
-    Accounts for kappa's effect on both test and training encodings.
+    Accounts for kappa's effect on both the evaluation and the reference encoding.
 
     Parameters
     ----------
     pipeline : Pipeline
         Fitted pipeline containing kappa_encoder and eta_regressor steps.
-    X : ndarray, shape (n_test, n_features)
-        Test features.
-    y : ndarray, shape (n_test,)
-        Test targets.
+    X : ndarray, shape (n_eval, n_features)
+        Evaluation-set features.
+    y : ndarray, shape (n_eval,)
+        Evaluation-set targets.
     p : int
         Feature index for which to compute the kappa derivative.
     X_train : ndarray, shape (n_train, n_features)
@@ -90,7 +104,7 @@ def analytical_derivative_kappa_complete(
     total_derivative = 0.0
 
     for i in range(len(X)):
-        # Part 1: Effect through test-data encoding  d(x̃_test)/d(kappa)
+        # Part 1: the evaluation pathway, d(x_tilde_eval)/d(kappa)
         x_i = X[i, p]
         distances_kappa = np.abs(x_i - X_train_enc)
         weights_kappa = 1 / (1 + distances_kappa) ** kappa_p
@@ -104,7 +118,7 @@ def analytical_derivative_kappa_complete(
         den = np.sum(weights_kappa) ** 2
         d_xtilde_test_d_kappa = num / den if den != 0 else 0
 
-        # d(ŷ_i)/d(x̃_test_i)
+        # d(y_hat_i)/d(x_tilde_eval_i)
         tilde_x_i = X_transformed[i, 0]
         distances_test = np.abs(tilde_x_i - X_train_transformed[:, 0])
         weights_eta = 1 / (1 + distances_test) ** eta
@@ -119,7 +133,7 @@ def analytical_derivative_kappa_complete(
         den = np.sum(weights_eta) ** 2
         d_yhat_d_xtilde_test = num / den if den != 0 else 0
 
-        # Part 2: Effect through training-data encoding  d(x̃_train)/d(kappa)
+        # Part 2: the reference-set pathway, d(x_tilde_train)/d(kappa)
         d_yhat_d_kappa_from_train = 0.0
         sum_weights = np.sum(weights_eta)
         sum_y_weights = np.sum(y_train_reg * weights_eta)
