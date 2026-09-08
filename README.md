@@ -1,8 +1,3 @@
-# Quasi-Newton Methods for Kappa-Eta Regression
-
-Code supporting the paper's empirical results: gradient validation, an optimizer
-comparison (Adam, L-BFGS, SciPy's L-BFGS-B, and a grid-search baseline) across a
-20-dataset panel, and the epsilon-sensitivity and scaling analyses of the appendix.
 
 ## Layout
 
